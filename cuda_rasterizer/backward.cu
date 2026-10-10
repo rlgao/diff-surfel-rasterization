@@ -433,10 +433,26 @@ renderCUDA(
 				const float dG_ddely = -G * FilterInvSquare * d.y;
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
-				// // Propagate the gradients of depth
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  s.y * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
+				// Depth uses the ray-plane intersection in both filter branches.
+				// Retain its complete chain through s = p.xy / p.z.
+				const float2 dL_ds = {dL_dz * Tw.x, dL_dz * Tw.y};
+				const float dsx_pz = dL_ds.x / p.z;
+				const float dsy_pz = dL_ds.y / p.z;
+				const float3 dL_dp = {dsx_pz, dsy_pz, -(dsx_pz * s.x + dsy_pz * s.y)};
+				const float3 dL_dk = cross(l, dL_dp);
+				const float3 dL_dl = cross(dL_dp, k);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 0], -dL_dk.x);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 1], -dL_dk.y);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 2], -dL_dk.z);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 3], -dL_dl.x);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 4], -dL_dl.y);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 5], -dL_dl.z);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 6],
+					pixf.x * dL_dk.x + pixf.y * dL_dl.x + s.x * dL_dz);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 7],
+					pixf.x * dL_dk.y + pixf.y * dL_dl.y + s.y * dL_dz);
+				atomicAdd(&dL_dtransMat[global_id * 9 + 8],
+					pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz);
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
