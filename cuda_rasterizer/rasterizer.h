@@ -50,8 +50,8 @@ namespace CudaRasterizer
 			const bool prefiltered,
 			float* out_color,
 			float* out_others,
-			int* radii = nullptr,
-			bool debug = false);
+			int* radii,
+			bool debug, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -83,7 +83,7 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
-			bool debug);
+			bool debug, int depth_policy, float depth_epsilon);
 	};
 };
 

@@ -56,8 +56,34 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const bool debug)
+	const bool debug, int depth_policy, float depth_epsilon,
+ const torch::Tensor& trace_pixels, torch::Tensor& trace_ids,
+ torch::Tensor& trace_records, torch::Tensor& trace_counts)
 {
+  TORCH_CHECK(depth_policy == 0 || depth_policy == 1, "invalid depth policy");
+  TORCH_CHECK(depth_policy == 0 || (std::isfinite(depth_epsilon) && depth_epsilon > 0),
+              "invalid depth conditioning epsilon");
+  const int trace_n = trace_pixels.size(0);
+  const int trace_capacity = trace_ids.size(1);
+  TORCH_CHECK(trace_n <= 8 && trace_capacity <= 1024, "trace bound exceeded");
+  TORCH_CHECK(trace_pixels.is_cuda() && trace_pixels.is_contiguous()
+              && trace_pixels.scalar_type() == torch::kInt32 && trace_pixels.dim() == 2
+              && trace_pixels.size(1) == 2, "trace pixels must be CUDA int32 Nx2");
+  TORCH_CHECK(trace_ids.is_cuda() && trace_ids.is_contiguous()
+              && trace_ids.scalar_type() == torch::kInt64 && trace_ids.size(0) == trace_n
+              && trace_records.is_cuda() && trace_records.is_contiguous()
+              && trace_records.scalar_type() == torch::kFloat32
+              && trace_records.sizes() == torch::IntArrayRef({trace_n, trace_capacity, 18})
+              && trace_counts.is_cuda() && trace_counts.is_contiguous()
+              && trace_counts.scalar_type() == torch::kInt32
+              && trace_counts.sizes() == torch::IntArrayRef({trace_n, 8}), "invalid trace outputs");
+  if (trace_n) {
+    TORCH_CHECK(trace_capacity > 0 && trace_pixels.select(1,0).min().item<int>() >= 0
+                && trace_pixels.select(1,0).max().item<int>() < image_width
+                && trace_pixels.select(1,1).min().item<int>() >= 0
+                && trace_pixels.select(1,1).max().item<int>() < image_height,
+                "trace pixel outside image");
+  }
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
@@ -128,7 +154,9 @@ RasterizeGaussiansCUDA(
 		out_color.contiguous().data<float>(),
 		out_others.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
-		debug);
+		debug, depth_policy, depth_epsilon, trace_n, trace_capacity,
+        trace_pixels.data_ptr<int>(), trace_ids.data_ptr<int64_t>(),
+        trace_records.data_ptr<float>(), trace_counts.data_ptr<int>());
   }
   return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
 }
@@ -156,7 +184,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const bool debug) 
+	const bool debug, int depth_policy, float depth_epsilon)
 {
 
   CHECK_INPUT(background);
@@ -226,7 +254,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dsh.contiguous().data<float>(),
 	  dL_dscales.contiguous().data<float>(),
 	  dL_drotations.contiguous().data<float>(),
-	  debug);
+	  debug, depth_policy, depth_epsilon);
   }
 
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations);
@@ -251,4 +279,30 @@ torch::Tensor markVisible(
   }
   
   return present;
+}
+
+#include "cuda_rasterizer/rasterizer_impl.h"
+#include "cuda_rasterizer/forward.h"
+std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> TraceDepthCUDA(
+ int P,int R,int W,int H,torch::Tensor geom,torch::Tensor binning,torch::Tensor image,
+ torch::Tensor matrices,torch::Tensor pixels,int capacity,int policy,float epsilon) {
+ TORCH_CHECK(P>0 && R>=0 && W>0 && H>0,"invalid trace buffers");
+ TORCH_CHECK(pixels.is_cuda() && pixels.scalar_type()==torch::kInt32 && pixels.dim()==2
+             && pixels.size(1)==2 && pixels.is_contiguous(),"trace pixels must be CUDA int32 Nx2");
+ int N=pixels.size(0);
+ TORCH_CHECK(N>0 && N<=8 && capacity>0 && capacity<=1024,"trace bound exceeded");
+ TORCH_CHECK(pixels.select(1,0).min().item<int>()>=0 && pixels.select(1,0).max().item<int>()<W
+             && pixels.select(1,1).min().item<int>()>=0 && pixels.select(1,1).max().item<int>()<H,
+             "trace pixel outside image");
+ char* g=reinterpret_cast<char*>(geom.data_ptr<uint8_t>());char* b=reinterpret_cast<char*>(binning.data_ptr<uint8_t>());char* i=reinterpret_cast<char*>(image.data_ptr<uint8_t>());
+ auto gs=CudaRasterizer::GeometryState::fromChunk(g,P);
+ auto bs=CudaRasterizer::BinningState::fromChunk(b,R);
+ auto is=CudaRasterizer::ImageState::fromChunk(i,W*H);
+ auto out_ids=torch::full({N,capacity},-1,pixels.options().dtype(torch::kInt64));
+ auto records=torch::zeros({N,capacity,16},pixels.options().dtype(torch::kFloat32));
+ auto counts=torch::zeros({N,2},pixels.options());
+ FORWARD::trace(N,capacity,pixels.data_ptr<int>(),W,H,is.ranges,bs.point_list,gs.means2D,
+   matrices.numel() ? matrices.data_ptr<float>():gs.transMat,gs.normal_opacity,policy,epsilon,
+   out_ids.data_ptr<int64_t>(),records.data_ptr<float>(),counts.data_ptr<int>());
+ return std::make_tuple(out_ids,records,counts);
 }

@@ -76,8 +76,23 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
-            raster_settings.debug
+            raster_settings.debug,
+            raster_settings.depth_policy,
+            raster_settings.depth_epsilon
         )
+
+        trace_n = len(raster_settings.trace_pixels)
+        capacity = raster_settings.trace_capacity if trace_n else 0
+        if trace_n and (not callable(raster_settings.trace_callback)
+                        or not 0 < trace_n <= 8 or not 0 < capacity <= 1024
+                        or len(set(raster_settings.trace_pixels)) != trace_n):
+            raise ValueError("trace requires bounded unique pixels and an explicit consumer")
+        pixels = torch.tensor(raster_settings.trace_pixels, device=means3D.device,
+                              dtype=torch.int32).reshape(trace_n, 2)
+        trace_ids = torch.full((trace_n, capacity), -1, device=means3D.device, dtype=torch.int64)
+        trace_records = torch.zeros((trace_n, capacity, 18), device=means3D.device)
+        trace_counts = torch.zeros((trace_n, 8), device=means3D.device, dtype=torch.int32)
+        args += (pixels, trace_ids, trace_records, trace_counts)
 
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
@@ -90,6 +105,9 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raise ex
         else:
             num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+
+        if trace_n:
+            raster_settings.trace_callback((trace_ids, trace_records, trace_counts))
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -127,7 +145,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 num_rendered,
                 binningBuffer,
                 imgBuffer,
-                raster_settings.debug)
+                raster_settings.debug, raster_settings.depth_policy, raster_settings.depth_epsilon)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -168,6 +186,11 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor
     prefiltered : bool
     debug : bool
+    depth_policy: int = 0
+    depth_epsilon: float = 0.0
+    trace_pixels: tuple = ()
+    trace_capacity: int = 0
+    trace_callback: object = None
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

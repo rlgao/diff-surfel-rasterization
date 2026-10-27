@@ -35,7 +35,9 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const bool debug);
+	const bool debug, int depth_policy, float depth_epsilon,
+ const torch::Tensor& trace_pixels, torch::Tensor& trace_ids,
+ torch::Tensor& trace_records, torch::Tensor& trace_counts);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
@@ -60,9 +62,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const bool debug);
+	const bool debug, int depth_policy, float depth_epsilon);
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix);
+
+std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> TraceDepthCUDA(
+ int P,int R,int W,int H,torch::Tensor geom,torch::Tensor binning,torch::Tensor image,
+ torch::Tensor matrices,torch::Tensor pixels,int capacity,int policy,float epsilon);

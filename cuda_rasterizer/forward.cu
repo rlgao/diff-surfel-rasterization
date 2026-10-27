@@ -253,7 +253,27 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+// Stores values already computed by compositing; no intersection is replayed.
+__device__ __forceinline__ void recordActualDepth(
+ int slot, int capacity, int id, int64_t* ids, float* records, int* counts,
+ float pz, float rho3d, float rho2d, bool plane, float depth, float alpha,
+ float T, float weight, int reason, float centre, float before, float after,
+ uint32_t contributor) {
+ if (slot < 0) return;
+ int n = counts[8*slot];
+ if (n >= capacity) { counts[8*slot+1] = 1; return; }
+ counts[8*slot] = n+1;
+ int at = slot*capacity+n;
+ ids[at] = id;
+ float* row = records+18*at;
+ row[0]=pz; row[1]=rho3d; row[2]=rho2d; row[3]=plane;
+ row[4]=depth; row[5]=alpha; row[6]=T; row[7]=weight;
+ row[8]=after-before; row[9]=reason; row[10]=centre;
+ row[11]=0.f; row[12]=0.f; row[13]=contributor; row[14]=0.f; row[15]=0.f;
+ row[16]=before; row[17]=after;
+}
+
+template <uint32_t CHANNELS, bool SAFE_DEPTH, bool TRACE>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -269,7 +289,7 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_others)
+	float* __restrict__ out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -279,6 +299,10 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y};
+
+ int trace_slot = -1;
+ if (TRACE) for (int n=0; n<trace_n; ++n)
+   if (pix.x == trace_pixels[2*n] && pix.y == trace_pixels[2*n+1]) trace_slot=n;
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -345,6 +369,7 @@ renderCUDA(
 		{
 			// Keep track of current position in range
 			contributor++;
+            if (TRACE && trace_slot >= 0) trace_counts[8*trace_slot+7]++;
 
 			// Fisrt compute two homogeneous planes, See Eq. (8)
 			const float2 xy = collected_xy[j];
@@ -356,39 +381,78 @@ renderCUDA(
 			float3 l = pix.y * Tw - Tv;
 			// Cross product of two planes is a line, Eq. (9)
 			float3 p = cross(k, l);
-			if (p.z == 0.0) continue;
+			float2 s, d;
+			float rho3d, rho2d, rho, depth;
+			bool plane_support;
+			if (!SAFE_DEPTH) {
+			if (p.z == 0.0) {
+                if (TRACE && trace_slot >= 0) trace_counts[8*trace_slot+2]++;
+                continue;
+            }
 			// Perspective division to get the intersection (u,v), Eq. (10)
-			float2 s = {p.x / p.z, p.y / p.z};
-			float rho3d = (s.x * s.x + s.y * s.y); 
+			s = {p.x / p.z, p.y / p.z};
+			rho3d = (s.x * s.x + s.y * s.y);
 			// Add low pass filter
-			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
-			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
-			float rho = min(rho3d, rho2d);
+			d = {xy.x - pixf.x, xy.y - pixf.y};
+			rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y);
+			rho = min(rho3d, rho2d);
 
 			// compute depth
-			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
+			depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
 			// if a point is too small, its depth is not reliable?
 			// depth = (rho3d <= rho2d) ? depth : Tw.z 
-			if (depth < near_n) continue;
+			if (depth < near_n) {
+                if (TRACE && trace_slot >= 0) trace_counts[8*trace_slot+3]++;
+                continue;
+            }
+
+				plane_support = rho3d <= rho2d;
+			} else {
+				d = {xy.x - pixf.x, xy.y - pixf.y};
+				rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y);
+				const bool conditioned = isfinite(p.z) && fabsf(p.z) >
+					depth_epsilon * (fabsf(k.x * l.y) + fabsf(k.y * l.x));
+				s = conditioned ? make_float2(p.x / p.z, p.y / p.z) : make_float2(0.f, 0.f);
+				rho3d = s.x * s.x + s.y * s.y;
+				const float plane_depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
+				plane_support = conditioned && isfinite(rho3d) && isfinite(plane_depth)
+					&& plane_depth >= near_n && rho3d <= rho2d;
+				rho = plane_support ? rho3d : rho2d;
+				depth = plane_support ? plane_depth : Tw.z;
+				if (!isfinite(depth) || depth < near_n || !isfinite(rho)) {
+                    if (TRACE && trace_slot >= 0) trace_counts[8*trace_slot+3]++;
+                    continue;
+                }
+			}
 
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
 
 			float power = -0.5f * rho;
-			if (power > 0.0f)
-				continue;
+			if (power > 0.0f) {
+                if (TRACE && trace_slot >= 0) trace_counts[8*trace_slot+4]++;
+                continue;
+            }
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, opa * exp(power));
-			if (alpha < 1.0f / 255.0f)
-				continue;
+			if (alpha < 1.0f / 255.0f) {
+                if (TRACE && trace_slot >= 0) trace_counts[8*trace_slot+5]++;
+                continue;
+            }
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
+                if (TRACE) {
+                    if (trace_slot >= 0) trace_counts[8*trace_slot+6]++;
+                    recordActualDepth(trace_slot,trace_capacity,collected_id[j],trace_ids,
+                        trace_records,trace_counts,p.z,rho3d,rho2d,plane_support,depth,
+                        alpha,T,0.f,2,Tw.z,D,D,contributor);
+                }
 				done = true;
 				continue;
 			}
@@ -400,7 +464,11 @@ renderCUDA(
 			float A = 1-T;
 			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
 			distortion += (m * m * A + M2 - 2 * m * M1) * w;
+            float trace_before = D;
 			D  += depth * w;
+            if (TRACE) recordActualDepth(trace_slot,trace_capacity,collected_id[j],trace_ids,
+                trace_records,trace_counts,p.z,rho3d,rho2d,plane_support,depth,
+                alpha,T,w,0,Tw.z,trace_before,D,contributor);
 			M1 += m * w;
 			M2 += m * m * w;
 
@@ -462,23 +530,27 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_others)
+	float* out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
-		ranges,
-		point_list,
-		W, H,
-		focal_x, focal_y,
-		means2D,
-		colors,
-		transMats,
-		depths,
-		normal_opacity,
-		final_T,
-		n_contrib,
-		bg_color,
-		out_color,
-		out_others);
+    if (depth_policy == 0) {
+        if (trace_n) {renderCUDA<NUM_CHANNELS, false, true><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
+        else {renderCUDA<NUM_CHANNELS, false, false><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
+    } else {
+        if (trace_n) {renderCUDA<NUM_CHANNELS, true, true><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
+        else {renderCUDA<NUM_CHANNELS, true, false><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
+    }
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -534,4 +606,60 @@ void FORWARD::preprocess(int P, int D, int M,
 		tiles_touched,
 		prefiltered
 		);
+}
+
+// Diagnostic replay of actual sorted native buffers. Does not mutate render state.
+__global__ void traceDepthKernel(int N, int capacity, const int* pixels, int W, int H,
+ const uint2* ranges, const uint32_t* ids, const float2* xy,
+ const float* matrices, const float4* normals, int policy, float epsilon,
+ int64_t* output_ids, float* records, int* counts) {
+ int n = blockIdx.x * blockDim.x + threadIdx.x;
+ if (n >= N) return;
+ int u = pixels[2*n], v = pixels[2*n+1];
+ const uint2 range = ranges[(v/BLOCK_Y)*((W+BLOCK_X-1)/BLOCK_X)+u/BLOCK_X];
+ float T=1.f;
+ int count=0;
+ for (uint32_t offset=range.x; offset<range.y; ++offset) {
+  uint32_t id=ids[offset];
+  float3 Tu=make_float3(matrices[9*id],matrices[9*id+1],matrices[9*id+2]);
+  float3 Tv=make_float3(matrices[9*id+3],matrices[9*id+4],matrices[9*id+5]);
+  float3 Tw=make_float3(matrices[9*id+6],matrices[9*id+7],matrices[9*id+8]);
+  float3 k=u*Tw-Tu,l=v*Tw-Tv,p=cross(k,l);
+  float2 d={xy[id].x-u,xy[id].y-v};
+  float rho2d=FilterInvSquare*(d.x*d.x+d.y*d.y);
+  bool conditioned=isfinite(p.z) && fabsf(p.z)>epsilon*(fabsf(k.x*l.y)+fabsf(k.y*l.x));
+  float2 s=(policy==0 || conditioned) ? make_float2(p.x/p.z,p.y/p.z) : make_float2(0.f,0.f);
+  float rho3d=s.x*s.x+s.y*s.y;
+  float plane_depth=(s.x*Tw.x+s.y*Tw.y)+Tw.z;
+  bool plane=policy==0 ? rho3d<=rho2d : conditioned && isfinite(rho3d)
+       && isfinite(plane_depth) && plane_depth>=near_n && rho3d<=rho2d;
+  float rho=policy==0 ? min(rho3d,rho2d) : (plane ? rho3d:rho2d);
+  float depth=(policy==0 || plane) ? plane_depth:Tw.z;
+  float alpha=min(0.99f,normals[id].w*exp(-0.5f*rho));
+  // Record contributors with non-negligible screen/plane support, including depth rejects.
+  if (alpha<1.f/255.f || -0.5f*rho>0.f) continue;
+  int reason=0;
+  if ((policy==0 && p.z==0.f) || depth<near_n ||
+      (policy!=0 && (!isfinite(depth)||!isfinite(rho)))) reason=1;
+  float nextT=T*(1-alpha);
+  if (!reason && nextT<0.0001f) reason=2;
+  if (count>=capacity) {counts[2*n+1]=1;break;}
+  int at=n*capacity+count++;
+  output_ids[at]=id;
+  float* row=records+16*at;
+  row[0]=p.z; row[1]=rho3d; row[2]=rho2d; row[3]=plane;
+  row[4]=depth; row[5]=alpha; row[6]=T; row[7]=reason ? 0.f:alpha*T;
+  row[8]=depth*row[7]; row[9]=reason; row[10]=Tw.z; row[11]=plane_depth;
+  row[12]=conditioned; row[13]=offset-range.x; row[14]=k.x*l.y;row[15]=k.y*l.x;
+  if (reason==2) break;
+  if (!reason) T=nextT;
+ }
+ counts[2*n]=count;
+}
+void FORWARD::trace(int N,int capacity,const int* pixels,int W,int H,
+ const uint2* ranges,const uint32_t* ids,const float2* xy,
+ const float* matrices,const float4* normals,int policy,float epsilon,
+ int64_t* output_ids,float* records,int* counts) {
+ traceDepthKernel<<<1,32>>>(N,capacity,pixels,W,H,ranges,ids,xy,matrices,normals,
+                          policy,epsilon,output_ids,records,counts);
 }

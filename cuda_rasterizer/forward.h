@@ -65,8 +65,15 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
-		float* out_others);
+		float* out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts);
 }
 
 
 #endif
+
+namespace FORWARD {
+void trace(int N, int capacity, const int* pixels, int W, int H,
+ const uint2* ranges, const uint32_t* ids, const float2* xy,
+ const float* matrices, const float4* normals, int policy, float epsilon,
+ int64_t* output_ids, float* records, int* counts);
+}

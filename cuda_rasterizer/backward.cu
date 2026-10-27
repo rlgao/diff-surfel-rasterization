@@ -140,7 +140,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C, bool SAFE_DEPTH>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -161,7 +161,7 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors, int depth_policy, float depth_epsilon)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -288,19 +288,39 @@ renderCUDA(
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
+			float2 s, d;
+			float rho3d, rho2d, rho, c_d;
+			bool plane_support;
+			if (!SAFE_DEPTH) {
 			if (p.z == 0.0) continue;
-			float2 s = {p.x / p.z, p.y / p.z};
-			float rho3d = (s.x * s.x + s.y * s.y); 
-			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
-			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
-			float rho = min(rho3d, rho2d);
+			s = {p.x / p.z, p.y / p.z};
+			rho3d = (s.x * s.x + s.y * s.y);
+			d = {xy.x - pixf.x, xy.y - pixf.y};
+			rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y);
+			rho = min(rho3d, rho2d);
 
 			// compute depth
-			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
+			c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
 			// if a point is too small, its depth is not reliable?
 			// c_d = (rho3d <= rho2d) ? c_d : Tw.z; 
 			if (c_d < near_n) continue;
 			
+				plane_support = rho3d <= rho2d;
+			} else {
+				d = {xy.x - pixf.x, xy.y - pixf.y};
+				rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y);
+				const bool conditioned = isfinite(p.z) && fabsf(p.z) >
+					depth_epsilon * (fabsf(k.x * l.y) + fabsf(k.y * l.x));
+				s = conditioned ? make_float2(p.x / p.z, p.y / p.z) : make_float2(0.f, 0.f);
+				rho3d = s.x * s.x + s.y * s.y;
+				const float plane_depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
+				plane_support = conditioned && isfinite(rho3d) && isfinite(plane_depth)
+					&& plane_depth >= near_n && rho3d <= rho2d;
+				rho = plane_support ? rho3d : rho2d;
+				c_d = plane_support ? plane_depth : Tw.z;
+				if (!isfinite(c_d) || c_d < near_n || !isfinite(rho)) continue;
+			}
+
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
@@ -396,7 +416,7 @@ renderCUDA(
 			dL_dz += alpha * T * dL_ddepth; 
 #endif
 
-			if (rho3d <= rho2d) {
+			if (plane_support) {
 				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
 				const float2 dL_ds = {
 					dL_dG * -G * s.x + dL_dz * Tw.x,
@@ -433,6 +453,10 @@ renderCUDA(
 				const float dG_ddely = -G * FilterInvSquare * d.y;
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
+				if (SAFE_DEPTH) {
+					// Screen support uses only centre depth, never the discarded intersection.
+					atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dz);
+				} else {
 				// Depth uses the ray-plane intersection in both filter branches.
 				// Retain its complete chain through s = p.xy / p.z.
 				const float2 dL_ds = {dL_dz * Tw.x, dL_dz * Tw.y};
@@ -453,6 +477,7 @@ renderCUDA(
 					pixf.x * dL_dk.y + pixf.y * dL_dl.y + s.y * dL_dz);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],
 					pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz);
+				}
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
@@ -724,9 +749,10 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors, int depth_policy, float depth_epsilon)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	if (depth_policy == 0) {
+	renderCUDA<NUM_CHANNELS, false> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -745,6 +771,29 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors, depth_policy, depth_epsilon
 		);
+	} else {
+	renderCUDA<NUM_CHANNELS, true> << <grid, block >> >(
+		ranges,
+		point_list,
+		W, H,
+		focal_x, focal_y,
+		bg_color,
+		means2D,
+		normal_opacity,
+		transMats,
+		colors,
+		depths,
+		final_Ts,
+		n_contrib,
+		dL_dpixels,
+		dL_depths,
+		dL_dtransMat,
+		dL_dmean2D,
+		dL_dnormal3D,
+		dL_dopacity,
+		dL_dcolors, depth_policy, depth_epsilon
+		);
+	}
 }
