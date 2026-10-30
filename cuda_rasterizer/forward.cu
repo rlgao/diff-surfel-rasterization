@@ -144,8 +144,41 @@ __device__ bool compute_aabb(
 	return true;
 }
 
+// Bound alpha support without changing the legacy centre used by the shader.
+// Inputs are actual FP32 preprocessing values; additional bounds use FP64.
+__device__ int alpha_support_radius(const glm::mat3& T, const float2 filter_center,
+                                   float legacy_radius, float opacity)
+{
+    if (!isfinite(legacy_radius) || (double)legacy_radius >= (double)INT_MAX)
+        return INT_MAX;
+    const int old_radius = (int)legacy_radius;
+    const float alpha_cutoff = 1.0f / 255.0f; // Existing shader cutoff, same FP32 bits.
+    if (opacity <= alpha_cutoff) return old_radius;
+    const double rho_max = 2.0 * log((double)opacity / (double)alpha_cutoff);
+    const glm::dvec3 Tu(T[0]), Tv(T[1]), Tw(T[2]);
+    const glm::dvec3 t(rho_max, rho_max, -1.0);
+    const double d = glm::dot(t, Tw * Tw);
+    // A disk crossing the projective pole cannot have a finite image-space AABB.
+    if (!isfinite(d) || d >= 0.0 || !isfinite(rho_max)) return INT_MAX;
+    const glm::dvec3 f = t / d;
+    const double px = glm::dot(f, Tu * Tw), py = glm::dot(f, Tv * Tw);
+    const double vx = px * px - glm::dot(f, Tu * Tu);
+    const double vy = py * py - glm::dot(f, Tv * Tv);
+    if (!isfinite(px) || !isfinite(py) || !isfinite(vx) || !isfinite(vy) ||
+        vx < 0.0 || vy < 0.0) return INT_MAX;
+    const double plane_x = fabs(px - (double)filter_center.x) + sqrt(vx);
+    const double plane_y = fabs(py - (double)filter_center.y) + sqrt(vy);
+    const double filter_radius = sqrt(rho_max / (double)FilterInvSquare);
+    const double required = fmax(filter_radius, fmax(plane_x, plane_y));
+    if (!isfinite(required) || required >= (double)INT_MAX) return INT_MAX;
+    const float outward = nextafterf(__double2float_ru(required), INFINITY);
+    const float rounded = ceilf(outward);
+    if (!isfinite(rounded) || (double)rounded >= (double)INT_MAX) return INT_MAX;
+    return max(old_radius, (int)rounded);
+}
+
 // Perform initial steps for each Gaussian prior to rasterization.
-template<int C>
+template<int C, bool COMBINED>
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
 	const glm::vec2* scales,
@@ -230,8 +263,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		radius = ceil(max(max(extent.x, extent.y), cutoff * FilterSize));
 	}
 
+    if (COMBINED && (!isfinite(point_image.x) || !isfinite(point_image.y))) return;
+    const int support_radius = COMBINED ? alpha_support_radius(T, point_image, radius, opacities[idx]) : (int)radius;
 	uint2 rect_min, rect_max;
-	getRect(point_image, radius, rect_min, rect_max, grid);
+	if (COMBINED) getRectConservative(point_image, support_radius, rect_min, rect_max, grid);
+    else getRect(point_image, radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
@@ -244,7 +280,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	depths[idx] = p_view.z;
-	radii[idx] = (int)radius;
+	radii[idx] = support_radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
@@ -273,7 +309,7 @@ __device__ __forceinline__ void recordActualDepth(
  row[16]=before; row[17]=after;
 }
 
-template <uint32_t CHANNELS, bool SAFE_DEPTH, bool TRACE>
+template <uint32_t CHANNELS, bool SAFE_DEPTH, bool TRACE, bool WEIGHT>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -289,7 +325,7 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts)
+	float* __restrict__ out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts, float* normalization_weight)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -333,6 +369,7 @@ renderCUDA(
 	// render axutility ouput
 	float N[3] = {0};
 	float D = { 0 };
+    float weight_sum = 0.0f;
 	float M1 = {0};
 	float M2 = {0};
 	float distortion = {0};
@@ -466,6 +503,7 @@ renderCUDA(
 			distortion += (m * m * A + M2 - 2 * m * M1) * w;
             float trace_before = D;
 			D  += depth * w;
+            if (WEIGHT) weight_sum += w;
             if (TRACE) recordActualDepth(trace_slot,trace_capacity,collected_id[j],trace_ids,
                 trace_records,trace_counts,p.z,rho3d,rho2d,plane_support,depth,
                 alpha,T,w,0,Tw.z,trace_before,D,contributor);
@@ -507,6 +545,7 @@ renderCUDA(
 		final_T[pix_id + 2 * H * W] = M2;
 		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
 		out_others[pix_id + ALPHA_OFFSET * H * W] = 1 - T;
+        if (WEIGHT) normalization_weight[pix_id] = weight_sum;
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
@@ -530,26 +569,48 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts)
+	float* out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts, float* normalization_weight)
 {
+    if (normalization_weight) {
     if (depth_policy == 0) {
-        if (trace_n) {renderCUDA<NUM_CHANNELS, false, true><<<grid, block>>>(
+        if (trace_n) {renderCUDA<NUM_CHANNELS, false, true, true><<<grid, block>>>(
         ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
         normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
-        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
-        else {renderCUDA<NUM_CHANNELS, false, false><<<grid, block>>>(
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+        else {renderCUDA<NUM_CHANNELS, false, false, true><<<grid, block>>>(
         ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
         normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
-        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
     } else {
-        if (trace_n) {renderCUDA<NUM_CHANNELS, true, true><<<grid, block>>>(
+        if (trace_n) {renderCUDA<NUM_CHANNELS, true, true, true><<<grid, block>>>(
         ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
         normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
-        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
-        else {renderCUDA<NUM_CHANNELS, true, false><<<grid, block>>>(
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+        else {renderCUDA<NUM_CHANNELS, true, false, true><<<grid, block>>>(
         ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
         normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
-        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts);}
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+    }
+    } else {
+    if (depth_policy == 0) {
+        if (trace_n) {renderCUDA<NUM_CHANNELS, false, true, false><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+        else {renderCUDA<NUM_CHANNELS, false, false, false><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+    } else {
+        if (trace_n) {renderCUDA<NUM_CHANNELS, true, true, false><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+        else {renderCUDA<NUM_CHANNELS, true, false, false><<<grid, block>>>(
+        ranges,point_list,W,H,focal_x,focal_y,means2D,colors,transMats,depths,
+        normal_opacity,final_T,n_contrib,bg_color,out_color, out_others,
+        depth_policy,depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight);}
+    }
     }
 }
 
@@ -577,9 +638,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered, bool combined)
 {
-	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+    if (combined) {
+	preprocessCUDA<NUM_CHANNELS, true> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,
 		scales,
@@ -606,6 +668,35 @@ void FORWARD::preprocess(int P, int D, int M,
 		tiles_touched,
 		prefiltered
 		);
+    } else {
+	preprocessCUDA<NUM_CHANNELS, false> << <(P + 255) / 256, 256 >> > (
+		P, D, M,
+		means3D,
+		scales,
+		scale_modifier,
+		rotations,
+		opacities,
+		shs,
+		clamped,
+		transMat_precomp,
+		colors_precomp,
+		viewmatrix,
+		projmatrix,
+		cam_pos,
+		W, H,
+		tan_fovx, tan_fovy,
+		focal_x, focal_y,
+		radii,
+		means2D,
+		depths,
+		transMats,
+		rgb,
+		normal_opacity,
+		grid,
+		tiles_touched,
+		prefiltered
+		);
+    }
 }
 
 // Diagnostic replay of actual sorted native buffers. Does not mutate render state.

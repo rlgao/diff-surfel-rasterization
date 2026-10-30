@@ -140,7 +140,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 
 
 // Backward version of the rendering procedure.
-template <uint32_t C, bool SAFE_DEPTH>
+template <uint32_t C, bool SAFE_DEPTH, typename Accum, typename Centre>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -157,8 +157,8 @@ renderCUDA(
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_depths,
-	float * __restrict__ dL_dtransMat,
-	float3* __restrict__ dL_dmean2D,
+	Accum * __restrict__ dL_dtransMat,
+	Centre* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors, int depth_policy, float depth_epsilon)
@@ -745,14 +745,14 @@ void BACKWARD::render(
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_depths,
-	float * dL_dtransMat,
-	float3* dL_dmean2D,
+	double * dL_dtransMat,
+	double2* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors, int depth_policy, float depth_epsilon)
 {
 	if (depth_policy == 0) {
-	renderCUDA<NUM_CHANNELS, false> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS, false, double, double2> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -774,7 +774,92 @@ void BACKWARD::render(
 		dL_dcolors, depth_policy, depth_epsilon
 		);
 	} else {
-	renderCUDA<NUM_CHANNELS, true> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS, true, double, double2> << <grid, block >> >(
+		ranges,
+		point_list,
+		W, H,
+		focal_x, focal_y,
+		bg_color,
+		means2D,
+		normal_opacity,
+		transMats,
+		colors,
+		depths,
+		final_Ts,
+		n_contrib,
+		dL_dpixels,
+		dL_depths,
+		dL_dtransMat,
+		dL_dmean2D,
+		dL_dnormal3D,
+		dL_dopacity,
+		dL_dcolors, depth_policy, depth_epsilon
+		);
+	}
+}
+
+// One conversion after all FP64 atomic additions, before unchanged preprocessing.
+__global__ void castAccumulatedCUDA(int P, const double* transform, const double2* centre,
+                                   float* transform_float, float3* centre_float) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= P) return;
+    for (int j=0; j<9; ++j) transform_float[i*9+j] = static_cast<float>(transform[i*9+j]);
+    centre_float[i] = make_float3(static_cast<float>(centre[i].x),
+                                 static_cast<float>(centre[i].y), 0.0f);
+}
+void BACKWARD::castAccumulated(int P, const double* transform, const double2* centre,
+                              float* transform_float, float3* centre_float) {
+    if (P > 0) castAccumulatedCUDA<<<(P+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        P, transform, centre, transform_float, centre_float);
+}
+
+// Exact legacy accumulation path, without double scratch.
+void BACKWARD::render(
+	const dim3 grid, const dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	float focal_x, float focal_y,
+	const float* bg_color,
+	const float2* means2D,
+	const float4* normal_opacity,
+	const float* colors,
+	const float* transMats,
+	const float* depths,
+	const float* final_Ts,
+	const uint32_t* n_contrib,
+	const float* dL_dpixels,
+	const float* dL_depths,
+	float * dL_dtransMat,
+	float3* dL_dmean2D,
+	float* dL_dnormal3D,
+	float* dL_dopacity,
+	float* dL_dcolors, int depth_policy, float depth_epsilon)
+{
+	if (depth_policy == 0) {
+	renderCUDA<NUM_CHANNELS, false, float, float3> << <grid, block >> >(
+		ranges,
+		point_list,
+		W, H,
+		focal_x, focal_y,
+		bg_color,
+		means2D,
+		normal_opacity,
+		transMats,
+		colors,
+		depths,
+		final_Ts,
+		n_contrib,
+		dL_dpixels,
+		dL_depths,
+		dL_dtransMat,
+		dL_dmean2D,
+		dL_dnormal3D,
+		dL_dopacity,
+		dL_dcolors, depth_policy, depth_epsilon
+		);
+	} else {
+	renderCUDA<NUM_CHANNELS, true, float, float3> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,

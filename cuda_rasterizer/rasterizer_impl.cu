@@ -67,6 +67,7 @@ __global__ void checkFrustum(int P,
 
 // Generates one key/value pair for all Gaussian / tile overlaps. 
 // Run once per Gaussian (1:N mapping).
+template<bool COMBINED>
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
@@ -88,7 +89,8 @@ __global__ void duplicateWithKeys(
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		if (COMBINED) getRectConservative(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+        else getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
@@ -193,6 +195,71 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	return binning;
 }
 
+// Actual count reduction precedes uint32 scan and binning allocation.
+struct CombinedCount64 {
+    __host__ __device__ uint64_t operator()(const uint32_t& v) const { return v; }
+};
+struct CombinedGroup { uint64_t key; uint32_t id; uint32_t pad; };
+__global__ void combinedGroups(int tiles, const uint2* ranges, const float* depths,
+    const uint32_t* ids, double span, CombinedGroup* groups, int64_t* statistics) {
+    int tile=blockIdx.x*blockDim.x+threadIdx.x;
+    if (tile>=tiles) return;
+    uint32_t begin=ranges[tile].x,stop=ranges[tile].y;
+    while (begin<stop) {
+        double nearest=static_cast<double>(depths[ids[begin]]);
+        uint32_t end=begin+1;
+        while (end<stop && static_cast<double>(depths[ids[end]])-nearest<=span*nearest) ++end;
+        atomicMax(reinterpret_cast<unsigned long long*>(statistics+3),static_cast<unsigned long long>(end-begin));
+        atomicAdd(reinterpret_cast<unsigned long long*>(statistics+4),1ULL);
+        uint64_t key=(static_cast<uint64_t>(tile)<<32)|begin;
+        for(uint32_t j=begin;j<end;++j) groups[j]={key,ids[j],0};
+        begin=end;
+    }
+}
+
+// Two stable full-width radix passes yield (anchored-group key, persistent ID).
+// Reuse the existing binning key/value pairs and full-64-bit CUB scratch query.
+__global__ void combinedIdentityKeys(int count, const CombinedGroup* groups,
+    const int64_t* stable_ids, uint64_t* keys, uint32_t* entries) {
+    int j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(j<count) { keys[j]=static_cast<uint64_t>(stable_ids[groups[j].id]); entries[j]=j; }
+}
+__global__ void combinedGroupKeys(int count, const CombinedGroup* groups,
+    const uint32_t* ordered_entries, uint64_t* keys, uint32_t* entries) {
+    int j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(j<count) { uint32_t entry=ordered_entries[j]; keys[j]=groups[entry].key; entries[j]=entry; }
+}
+__global__ void combinedRestoreEntries(int count, const CombinedGroup* groups,
+    const float* depths, uint64_t* keys, uint32_t* entries) {
+    int j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(j<count) {
+        CombinedGroup group=groups[entries[j]];
+        entries[j]=group.id;
+        keys[j]=(group.key & 0xffffffff00000000ULL) | __float_as_uint(depths[group.id]);
+    }
+}
+
+// Qualification prototype: one deterministic serial grouping task per tile.
+__global__ void nearTieOrder(int tiles, const uint2* ranges, const float* depths,
+    const int64_t* stable_ids, double relative_span, uint64_t* keys, uint32_t* ids) {
+    int tile = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tile >= tiles) return;
+    uint32_t begin = ranges[tile].x, stop = ranges[tile].y;
+    while (begin < stop) {
+        const double nearest = static_cast<double>(depths[ids[begin]]);
+        uint32_t end = begin + 1;
+        while (end < stop && static_cast<double>(depths[ids[end]]) - nearest <= relative_span * nearest) ++end;
+        for (uint32_t i = begin + 1; i < end; ++i) {
+            uint32_t id = ids[i]; uint64_t key = keys[i]; uint32_t j = i;
+            while (j > begin && stable_ids[ids[j-1]] > stable_ids[id]) {
+                ids[j] = ids[j-1]; keys[j] = keys[j-1]; --j;
+            }
+            ids[j] = id; keys[j] = key;
+        }
+        begin = end;
+    }
+}
+
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
 int CudaRasterizer::Rasterizer::forward(
@@ -218,12 +285,17 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* out_others,
 	int* radii,
-	bool debug, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts)
+	bool debug, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts, const int64_t* stable_ids, double relative_span, float* normalization_weight, CombinedSettings* combined)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
 	size_t chunk_size = required<GeometryState>(P);
+    const size_t image_size = required<ImageState>(static_cast<size_t>(width)*height);
+    const uint64_t fixed_bytes = static_cast<uint64_t>(chunk_size)+image_size+
+        static_cast<uint64_t>(P)*228+static_cast<uint64_t>(width)*height*44;
+    if (combined && fixed_bytes>combined->workspace_limit)
+        throw std::runtime_error("combined fixed workspace admission failed: required="+std::to_string(fixed_bytes));
 	char* chunkptr = geometryBuffer(chunk_size);
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
 
@@ -270,9 +342,24 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.normal_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered, normalization_weight != nullptr
 	), debug)
 
+    size_t reduction_workspace=0;
+    if (combined) {
+        using Input64=cub::TransformInputIterator<uint64_t,CombinedCount64,const uint32_t*>;
+        Input64 values(geomState.tiles_touched,CombinedCount64());
+        size_t bytes=0;
+        cub::DeviceReduce::Sum(nullptr,bytes,values,reinterpret_cast<uint64_t*>(combined->statistics+1),P);
+        if(fixed_bytes+bytes>combined->workspace_limit) throw std::runtime_error("combined count workspace admission failed");
+        reduction_workspace=bytes;
+        char* scratch=combined->workspace(bytes);
+        CHECK_CUDA(cub::DeviceReduce::Sum(scratch,bytes,values,reinterpret_cast<uint64_t*>(combined->statistics+1),P),debug)
+        int64_t actual=0;
+        CHECK_CUDA(cudaMemcpy(&actual,combined->statistics+1,sizeof(actual),cudaMemcpyDeviceToHost),debug)
+        if(actual<0 || actual>combined->max_duplicates || actual>INT_MAX)
+            throw std::runtime_error("combined duplication admission failed: required="+std::to_string(actual));
+    }
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
@@ -282,12 +369,22 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
+    if (combined) {
+        uint64_t group_bytes=static_cast<uint64_t>(num_rendered)*sizeof(CombinedGroup)+128;
+        uint64_t needed=fixed_bytes+binning_chunk_size+std::max(group_bytes,static_cast<uint64_t>(reduction_workspace));
+        if(needed>combined->workspace_limit)
+            throw std::runtime_error("combined binning workspace admission failed: required="+std::to_string(needed));
+        int64_t stats[]={P,num_rendered,static_cast<int64_t>(tile_grid.x*tile_grid.y),0,0,
+                         static_cast<int64_t>(needed),combined->sorting_mode,1};
+        CHECK_CUDA(cudaMemcpy(combined->statistics,stats,sizeof(stats),cudaMemcpyHostToDevice),debug)
+    }
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+    if (normalization_weight) {
+	duplicateWithKeys<true> << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
 		geomState.depths,
@@ -295,7 +392,18 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		tile_grid)
+		tile_grid);
+    } else {
+	duplicateWithKeys<false> << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid);
+    }
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -318,6 +426,47 @@ int CudaRasterizer::Rasterizer::forward(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
+    if (stable_ids) {
+        const int tile_count = tile_grid.x * tile_grid.y;
+        if (combined && num_rendered>0) {
+            auto groups=reinterpret_cast<CombinedGroup*>(combined->workspace(static_cast<size_t>(num_rendered)*sizeof(CombinedGroup)+128));
+            combinedGroups<<<(tile_count+255)/256,256>>>(tile_count,imgState.ranges,
+                geomState.depths,binningState.point_list,relative_span,groups,combined->statistics);
+            CHECK_CUDA(,debug)
+            int64_t largest=0;
+            CHECK_CUDA(cudaMemcpy(&largest,combined->statistics+3,sizeof(largest),cudaMemcpyDeviceToHost),debug)
+            if(largest>combined->max_near_group)
+                throw std::runtime_error("combined group admission failed: required="+std::to_string(largest));
+            if(combined->sorting_mode==1) {
+                const int blocks=(num_rendered+255)/256;
+                combinedIdentityKeys<<<blocks,256>>>(num_rendered,groups,stable_ids,
+                    binningState.point_list_keys_unsorted,binningState.point_list_unsorted);
+                CHECK_CUDA(,debug)
+                CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+                    binningState.list_sorting_space,binningState.sorting_size,
+                    binningState.point_list_keys_unsorted,binningState.point_list_keys,
+                    binningState.point_list_unsorted,binningState.point_list,
+                    num_rendered,0,64),debug)
+                combinedGroupKeys<<<blocks,256>>>(num_rendered,groups,binningState.point_list,
+                    binningState.point_list_keys_unsorted,binningState.point_list_unsorted);
+                CHECK_CUDA(,debug)
+                CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+                    binningState.list_sorting_space,binningState.sorting_size,
+                    binningState.point_list_keys_unsorted,binningState.point_list_keys,
+                    binningState.point_list_unsorted,binningState.point_list,
+                    num_rendered,0,64),debug)
+                combinedRestoreEntries<<<blocks,256>>>(num_rendered,groups,geomState.depths,
+                    binningState.point_list_keys,binningState.point_list);
+                CHECK_CUDA(,debug)
+            }
+        }
+        if (!combined || combined->sorting_mode==0) {
+            nearTieOrder<<<(tile_count+255)/256,256>>>(tile_count, imgState.ranges,
+                geomState.depths, stable_ids, relative_span,
+                binningState.point_list_keys, binningState.point_list);
+            CHECK_CUDA(, debug)
+        }
+    }
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	const float* transMat_ptr = transMat_precomp != nullptr ? transMat_precomp : geomState.transMat;
@@ -336,7 +485,7 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.n_contrib,
 		background,
 		out_color,
-		out_others, depth_policy, depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts), debug)
+		out_others, depth_policy, depth_epsilon, trace_n, trace_capacity, trace_pixels, trace_ids, trace_records, trace_counts, normalization_weight), debug)
 
 	return num_rendered;
 }
@@ -373,7 +522,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
-	bool debug, int depth_policy, float depth_epsilon)
+	bool debug, int depth_policy, float depth_epsilon, double* accumulated_transform, double* accumulated_centre)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -396,6 +545,33 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 	const float* depth_ptr = geomState.depths;
 	const float* transMat_ptr = (transMat_precomp != nullptr) ? transMat_precomp : geomState.transMat;
+    if (accumulated_transform) {
+	CHECK_CUDA(BACKWARD::render(
+		tile_grid,
+		block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		focal_x, focal_y,
+		background,
+		geomState.means2D,
+		geomState.normal_opacity,
+		color_ptr,
+		transMat_ptr,
+		depth_ptr,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		dL_dpix,
+		dL_depths,
+		accumulated_transform,
+		(double2*)accumulated_centre,
+		dL_dnormal,
+		dL_dopacity,
+		dL_dcolor, depth_policy, depth_epsilon), debug)
+
+    CHECK_CUDA(BACKWARD::castAccumulated(P, accumulated_transform,
+        (double2*)accumulated_centre, dL_dtransMat, (float3*)dL_dmean2D), debug)
+    } else {
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -419,6 +595,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dcolor, depth_policy, depth_epsilon), debug)
 
+    }
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.

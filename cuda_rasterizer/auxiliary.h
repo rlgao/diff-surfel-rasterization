@@ -1,3 +1,4 @@
+#include <climits>
 /*
  * Copyright (C) 2023, Inria
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -74,6 +75,25 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
 	};
+}
+
+// INT_MAX is the explicit full-image support sentinel, not a finite pixel radius.
+__forceinline__ __device__ void getRectConservative(const float2 p, int max_radius,
+    uint2& rect_min, uint2& rect_max, dim3 grid)
+{
+    if (max_radius == INT_MAX) {
+        rect_min = {0, 0}; rect_max = {grid.x, grid.y}; return;
+    }
+    // Directed arithmetic retains the old nearest-rounded interval and expands outward.
+    const float r = __int2float_ru(max_radius);
+    const float lo_x = floorf(__fsub_rd(p.x, r) / BLOCK_X);
+    const float lo_y = floorf(__fsub_rd(p.y, r) / BLOCK_Y);
+    const float hi_x = floorf(__fadd_ru(p.x, r) / BLOCK_X) + 1.0f;
+    const float hi_y = floorf(__fadd_ru(p.y, r) / BLOCK_Y) + 1.0f;
+    rect_min = {(unsigned)fminf((float)grid.x, fmaxf(0.0f, lo_x)),
+                (unsigned)fminf((float)grid.y, fmaxf(0.0f, lo_y))};
+    rect_max = {(unsigned)fminf((float)grid.x, fmaxf(0.0f, hi_x)),
+                (unsigned)fminf((float)grid.y, fmaxf(0.0f, hi_y))};
 }
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)

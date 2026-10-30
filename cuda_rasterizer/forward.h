@@ -47,7 +47,7 @@ namespace FORWARD
 		float4* normal_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered, bool combined);
 
 	// Main rasterization method.
 	void render(
@@ -65,7 +65,7 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
-		float* out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts);
+		float* out_others, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts, float* normalization_weight);
 }
 
 

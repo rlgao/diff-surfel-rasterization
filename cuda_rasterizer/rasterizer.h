@@ -14,9 +14,18 @@
 
 #include <vector>
 #include <functional>
+#include <cstdint>
 
 namespace CudaRasterizer
 {
+    struct CombinedSettings {
+        int64_t max_duplicates;
+        uint64_t workspace_limit;
+        int max_near_group;
+        int sorting_mode;
+        std::function<char* (size_t)> workspace;
+        int64_t* statistics;
+    };
 	class Rasterizer
 	{
 	public:
@@ -51,7 +60,7 @@ namespace CudaRasterizer
 			float* out_color,
 			float* out_others,
 			int* radii,
-			bool debug, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts);
+			bool debug, int depth_policy, float depth_epsilon, int trace_n, int trace_capacity, const int* trace_pixels, int64_t* trace_ids, float* trace_records, int* trace_counts, const int64_t* stable_ids, double relative_span, float* normalization_weight, CombinedSettings* combined = nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -83,7 +92,7 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
-			bool debug, int depth_policy, float depth_epsilon);
+			bool debug, int depth_policy, float depth_epsilon, double* accumulated_transform, double* accumulated_centre);
 	};
 };
 

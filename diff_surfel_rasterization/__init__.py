@@ -94,23 +94,45 @@ class _RasterizeGaussians(torch.autograd.Function):
         trace_counts = torch.zeros((trace_n, 8), device=means3D.device, dtype=torch.int32)
         args += (pixels, trace_ids, trace_records, trace_counts)
 
+        combined = raster_settings.combined_limits is not None
+        if combined:
+            if raster_settings.stable_ids is None:
+                raise ValueError("Combined renderer requires persistent IDs")
+            stats = torch.empty(0, device=means3D.device, dtype=torch.int64)
+            def forward_call(*a):
+                try:
+                    return _C.rasterize_gaussians_combined(
+                        *a, raster_settings.stable_ids, raster_settings.relative_span,
+                        raster_settings.combined_limits, stats)
+                except Exception:
+                    if callable(raster_settings.combined_callback) and stats.numel():
+                        raster_settings.combined_callback(stats.detach().cpu())
+                    raise
+        else:
+            forward_call = _C.rasterize_gaussians
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+                num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = forward_call(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+            num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = forward_call(*args)
 
+        if combined and callable(raster_settings.combined_callback):
+            raster_settings.combined_callback(stats.detach().cpu())
         if trace_n:
             raster_settings.trace_callback((trace_ids, trace_records, trace_counts))
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
+        ctx.combined = combined
+        if depth.shape[0] not in (7, 8):
+            raise ValueError("Unknown auxiliary-plane contract")
+        ctx.weight_sum_output = depth.shape[0] == 8
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
         return color, radii, depth
@@ -123,6 +145,11 @@ class _RasterizeGaussians(torch.autograd.Function):
         raster_settings = ctx.raster_settings
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
+        # sum(weights) and 1-T have the same smooth alpha derivative on fixed support.
+        # Keep public-alpha and normalization adjoints separate until this native boundary.
+        if ctx.weight_sum_output:
+            grad_depth = torch.cat((grad_depth[0:1], grad_depth[1:2] + grad_depth[7:8],
+                                    grad_depth[2:7]), dim=0)
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
                 means3D, 
@@ -147,17 +174,18 @@ class _RasterizeGaussians(torch.autograd.Function):
                 imgBuffer,
                 raster_settings.debug, raster_settings.depth_policy, raster_settings.depth_epsilon)
 
+        backward_call = _C.rasterize_gaussians_combined_backward if ctx.combined else _C.rasterize_gaussians_backward
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = backward_call(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = backward_call(*args)
 
         grads = (
             grad_means3D,
@@ -191,6 +219,10 @@ class GaussianRasterizationSettings(NamedTuple):
     trace_pixels: tuple = ()
     trace_capacity: int = 0
     trace_callback: object = None
+    combined_limits: object = None
+    stable_ids: object = None
+    relative_span: float = 0.0
+    combined_callback: object = None
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

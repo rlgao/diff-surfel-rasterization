@@ -18,4 +18,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("trace_depth", &TraceDepthCUDA);
   m.def("depth_safety_abi", []() { return 2; });
   m.def("mark_visible", &markVisible);
+  m.def("rasterize_gaussians_combined", &RasterizeGaussiansCombinedCUDA);
+  m.def("rasterize_gaussians_combined_backward", &RasterizeGaussiansCombinedBackwardCUDA);
+  m.def("combined_renderer_abi", [](){return 1;});
+  m.def("diagnostic_order_state", &DiagnosticOrderState);
+  m.def("diagnostic_geometry_state", &DiagnosticGeometryState);
 }
